@@ -25,6 +25,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Prepare web files only
+        run: |
+          rm -rf deploy
+          mkdir -p deploy/api/storage deploy/panel
+          cp index.php .htaccess deploy/
+          cp -r api/*.php api/core api/controllers deploy/api/
+          cp api/storage/.htaccess api/storage/.gitignore deploy/api/storage/
+          cp api/storage/devices.json.example deploy/api/storage/ 2>/dev/null || true
+          cp -r panel/*.php deploy/panel/
+          echo "Deploy dosya sayisi:"
+          find deploy -type f | wc -l
+
       - name: FTP Deploy
         uses: SamKirkland/FTP-Deploy-Action@v4.3.5
         with:
@@ -34,12 +46,7 @@ jobs:
           port: 21
           protocol: ${{ github.event.inputs.protocol || 'ftp' }}
           security: loose
-          local-dir: ./
+          local-dir: ./deploy/
           server-dir: /yeni.enjoyburgerhouse.com/
           timeout: 300000
-          exclude: |
-            **/.git*
-            **/.github/**
-            **/*.ino
-            **/api/storage/**
-            **/.ftp-deploy-sync-state.json
+          log-level: verbose
