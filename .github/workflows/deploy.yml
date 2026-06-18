@@ -6,10 +6,20 @@ on:
       - main
       - master
   workflow_dispatch:
+    inputs:
+      protocol:
+        description: 'FTP protokolü (ftp veya ftps)'
+        required: false
+        default: 'ftp'
+        type: choice
+        options:
+          - ftp
+          - ftps
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -18,10 +28,18 @@ jobs:
       - name: FTP Deploy
         uses: SamKirkland/FTP-Deploy-Action@v4.3.5
         with:
-          server: nero.veridyen.com
-          username: enjoybur
-          password: f#6g:7t7OBT8Ym
+          server: ${{ secrets.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
           port: 21
-          protocol: ftp
+          protocol: ${{ github.event.inputs.protocol || 'ftp' }}
+          security: loose
           local-dir: ./
           server-dir: /yeni.enjoyburgerhouse.com/
+          timeout: 300000
+          exclude: |
+            **/.git*
+            **/.github/**
+            **/*.ino
+            **/api/storage/**
+            **/.ftp-deploy-sync-state.json
