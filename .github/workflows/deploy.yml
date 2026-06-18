@@ -20,7 +20,7 @@ jobs:
         with:
           server: nero.veridyen.com
           username: enjoybur
-          password: ${{ secrets.FTP_PASSWORD }}
+          password: f#6g:7t7OBT8Ym
           port: 21
           protocol: ftp
           local-dir: ./

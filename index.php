@@ -1,1 +1,3 @@
-<h1>Test</h1>
+<?php
+header('Location: /panel/');
+exit;

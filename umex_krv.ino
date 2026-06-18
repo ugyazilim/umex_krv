@@ -8,6 +8,7 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <UniversalTelegramBot.h>
 #include <ArduinoJson.h>
 
@@ -26,6 +27,18 @@ UniversalTelegramBot bot(BOT_TOKEN, telegramClient);
 
 unsigned long lastTelegramCheck  = 0;
 const unsigned long telegramInterval = 5000;
+
+// ===== BULUT API (yeni.enjoyburgerhouse.com) =====
+const char* cloudApiHost   = "yeni.enjoyburgerhouse.com";
+const char* cloudApiBase   = "https://yeni.enjoyburgerhouse.com/api/v1";
+const char* cloudDeviceKey = "a7f3c9e2b18d4f650e9a1c3d5e7b9f12";
+const char* cloudDeviceId  = "karavan-1";
+
+WiFiClientSecure cloudClient;
+unsigned long lastCloudPush = 0;
+unsigned long lastCloudPoll = 0;
+const unsigned long cloudPushInterval = 15000;
+const unsigned long cloudPollInterval = 3000;
 
 IPAddress local_IP(192, 168, 1, 50);
 IPAddress gateway(192, 168, 1, 1);
@@ -85,6 +98,11 @@ typedef struct sensor_packet { uint8_t board_id; float temp_ds18b20; float temp_
 typedef struct btn_packet    { uint8_t board_id; uint8_t btn_id; } btn_packet; 
 
 void toggleRelay(int id);
+String buildStatusJson();
+bool executeCloudCommand(const String& action, JsonObject params);
+void cloudPushStatus();
+void cloudPollCommands();
+void cloudAckCommand(const String& commandId, bool success, const String& result = "");
 
 // ===================================================
 // CACHE SİSTEMİ — TÜM SENSÖRLER
@@ -394,6 +412,299 @@ void handleTelegramMessages(int n) {
     else if (text=="/w_azalt") {targetTemp--;if(targetTemp<1)targetTemp=1;EEPROM.put(ADDR_TARGET,targetTemp);EEPROM.commit();bot.sendMessage(chat_id,"❄️ Webasto Hedef: "+String(targetTemp,0)+" °C","");}
     else if (text=="/b_arttir"){targetWaterTemp++;if(targetWaterTemp>50)targetWaterTemp=50;EEPROM.put(ADDR_WATER_TARGET,targetWaterTemp);EEPROM.commit();bot.sendMessage(chat_id,"🔥 Boyler Hedef: "+String(targetWaterTemp,0)+" °C","");}
     else if (text=="/b_azalt") {targetWaterTemp--;if(targetWaterTemp<20)targetWaterTemp=20;EEPROM.put(ADDR_WATER_TARGET,targetWaterTemp);EEPROM.commit();bot.sendMessage(chat_id,"❄️ Boyler Hedef: "+String(targetWaterTemp,0)+" °C","");}
+  }
+}
+
+// ===== BULUT API FONKSİYONLARI =====
+String buildStatusJson() {
+  StaticJsonDocument<5120> doc;
+
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo, 10)) {
+    char tB[10], dB[15];
+    strftime(tB, sizeof(tB), "%H:%M", &timeinfo);
+    strftime(dB, sizeof(dB), "%d.%m.%Y", &timeinfo);
+    doc["time"] = tB;
+    doc["date"] = dB;
+    doc["day"]  = getDayName(timeinfo.tm_wday);
+  } else {
+    doc["time"] = "--:--";
+    doc["date"] = "--.--.----";
+    doc["day"]  = "----";
+  }
+
+  doc["device_id"] = cloudDeviceId;
+  doc["bat_main"] = stateMainBat ? 1 : 0;
+  doc["ups"]      = stateUPS ? 1 : 0;
+
+  for (int i = 0; i < 20; i++) {
+    char rk[4], nk[4];
+    snprintf(rk, sizeof(rk), "r%d", i + 1);
+    snprintf(nk, sizeof(nk), "n%d", i + 1);
+    doc[rk] = stateR[i] ? 1 : 0;
+    doc[nk] = relayNames[i];
+  }
+
+  doc["temp"]        = cache_temperature;
+  doc["t_out"]       = cache_tempOutside;
+  doc["t_wat"]       = cache_tempWater;
+  doc["t_ext"]       = cache_tempExtra;
+  doc["water"]       = cache_waterLevelPercent;
+  doc["water_liter"] = cache_waterLiters;
+  doc["bat"]         = cache_batteryVoltage;
+  doc["bat_percent"] = cache_batteryPercent;
+  doc["mq2"]         = cache_mq2;
+  doc["rain"]        = cache_rainPercent;
+  doc["pitch"]       = cache_pitch;
+  doc["roll"]        = cache_roll;
+  doc["rs2"]         = cache_rssi2;
+  doc["rs3"]         = cache_rssi3;
+  doc["rs4"]         = cache_rssi4;
+  doc["wh_target"]   = targetWaterTemp;
+  doc["wh_on"]       = waterHeaterOn ? 1 : 0;
+  doc["wh_auto"]     = waterHeaterAutoMode ? 1 : 0;
+  doc["f_target"]    = targetFridgeTemp;
+  doc["f_on"]        = fridgeFanOn ? 1 : 0;
+  doc["f_auto"]      = fridgeAutoMode ? 1 : 0;
+  doc["w_pwr"]       = stateWebastoPower ? 1 : 0;
+  doc["w_target"]    = targetTemp;
+  doc["w_on"]        = webastoOn ? 1 : 0;
+  doc["w_auto"]      = webastoAutoMode ? 1 : 0;
+  doc["gas_al"]      = gasAlarmEnabled ? 1 : 0;
+  doc["rain_al"]     = rainAlarmEnabled ? 1 : 0;
+
+  String info = "";
+  if (!stateWebastoPower) info = "GUC KESIK (SISTEM KAPALI)";
+  else if (webastoOn) {
+    unsigned long ms = totalWebastoOnTimeMs + (millis() - currentCycleStartTime);
+    info = "Calisma: " + String((ms / 60000) / 60) + "sa " + String((ms / 60000) % 60) + "dk";
+  } else if (!webastoAutoMode) info = "Oto Mod Kapali";
+  else {
+    unsigned long tso = millis() - lastTurnOffTime;
+    info = (!firstRun && tso < protectionTime)
+      ? "Koruma: " + String((protectionTime - tso) / 1000) + " sn"
+      : "Sistem Hazir";
+  }
+
+  doc["w_info"] = info;
+  doc["rssi"]   = WiFi.RSSI();
+
+  String out;
+  serializeJson(doc, out);
+  return out;
+}
+
+int cloudParamInt(JsonObject params, const char* key, int fallback = 0) {
+  if (!params[key].is<int>() && !params[key].is<double>()) return fallback;
+  return params[key].as<int>();
+}
+
+bool cloudHasParam(JsonObject params, const char* key) {
+  return !params[key].isNull();
+}
+
+bool executeCloudCommand(const String& action, JsonObject params) {
+  if (action == "toggleMainBat") {
+    stateMainBat = !stateMainBat;
+    digitalWrite(MAIN_BATTERY_RELAY_PIN, stateMainBat ? HIGH : LOW);
+    return true;
+  }
+  if (action == "toggleUPS") {
+    stateUPS = !stateUPS;
+    digitalWrite(UPS_RELAY_PIN, stateUPS ? HIGH : LOW);
+    return true;
+  }
+  if (action == "toggleWebastoPower") {
+    if (stateWebastoPower) {
+      if (webastoOn || (!firstRun && (millis() - lastTurnOffTime < protectionTime))) {
+        return false;
+      }
+    }
+    stateWebastoPower = !stateWebastoPower;
+    digitalWrite(WEBASTO_POWER_RELAY_PIN, stateWebastoPower ? HIGH : LOW);
+    if (!stateWebastoPower) { webastoOn = false; digitalWrite(WEBASTO_RELAY_PIN, LOW); }
+    return true;
+  }
+  if (action == "toggle") {
+    int id = cloudParamInt(params, "id", -1);
+    if (id < 1 || id > 20) return false;
+    toggleRelay(id);
+    return true;
+  }
+  if (action == "setRelayName") {
+    int id = cloudParamInt(params, "id", -1);
+    if (id < 1 || id > 20) return false;
+    if (!params["name"].is<const char*>()) return false;
+    const char* name = params["name"].as<const char*>();
+    if (!name || strlen(name) == 0) return false;
+    saveRelayName(id - 1, String(name));
+    return true;
+  }
+  if (action == "allOff") {
+    for (int i = 0; i < 20; i++) stateR[i] = false;
+    digitalWrite(RELAY1, LOW); digitalWrite(RELAY2, LOW); digitalWrite(RELAY3, LOW); digitalWrite(RELAY4, LOW);
+    digitalWrite(RELAY5, LOW); digitalWrite(RELAY6, LOW); digitalWrite(RELAY7, LOW); digitalWrite(RELAY8, LOW);
+    updateSlaves();
+    return true;
+  }
+  if (action == "setTarget") {
+    if (!cloudHasParam(params, "val")) return false;
+    targetTemp += cloudParamInt(params, "val");
+    targetTemp = constrain(targetTemp, 1, 35);
+    EEPROM.put(ADDR_TARGET, targetTemp); EEPROM.commit();
+    return true;
+  }
+  if (action == "setWaterTarget") {
+    if (!cloudHasParam(params, "val")) return false;
+    targetWaterTemp += cloudParamInt(params, "val");
+    targetWaterTemp = constrain(targetWaterTemp, 20, 50);
+    EEPROM.put(ADDR_WATER_TARGET, targetWaterTemp); EEPROM.commit();
+    return true;
+  }
+  if (action == "setFridgeTarget") {
+    if (!cloudHasParam(params, "val")) return false;
+    targetFridgeTemp += cloudParamInt(params, "val");
+    targetFridgeTemp = constrain(targetFridgeTemp, 40, 50);
+    EEPROM.put(ADDR_FRIDGE_TARGET, targetFridgeTemp); EEPROM.commit();
+    return true;
+  }
+  if (action == "toggleAuto") {
+    webastoAutoMode = !webastoAutoMode;
+    EEPROM.put(ADDR_AUTO_MODE, webastoAutoMode ? 1 : 0); EEPROM.commit();
+    return true;
+  }
+  if (action == "toggleWaterAuto") {
+    waterHeaterAutoMode = !waterHeaterAutoMode;
+    EEPROM.put(ADDR_WATER_AUTO_MODE, waterHeaterAutoMode ? 1 : 0); EEPROM.commit();
+    return true;
+  }
+  if (action == "toggleFridgeAuto") {
+    fridgeAutoMode = !fridgeAutoMode;
+    EEPROM.put(ADDR_FRIDGE_AUTO_MODE, fridgeAutoMode ? 1 : 0); EEPROM.commit();
+    return true;
+  }
+  if (action == "manualWebasto") {
+    if (!stateWebastoPower) return false;
+    triggerWebasto();
+    if (webastoOn) {
+      webastoOn = false;
+      lastTurnOffTime = millis();
+      firstRun = false;
+      totalWebastoOnTimeMs += (millis() - currentCycleStartTime);
+    } else {
+      webastoOn = true;
+      currentCycleStartTime = millis();
+    }
+    return true;
+  }
+  if (action == "manualWaterHeater") {
+    waterHeaterOn = !waterHeaterOn;
+    updateSlaves();
+    return true;
+  }
+  if (action == "manualFridge") {
+    fridgeFanOn = !fridgeFanOn;
+    updateSlaves();
+    return true;
+  }
+  if (action == "toggleGasAlarm") {
+    gasAlarmEnabled = !gasAlarmEnabled;
+    EEPROM.put(ADDR_GAS_ALARM, gasAlarmEnabled ? 1 : 0); EEPROM.commit();
+    return true;
+  }
+  if (action == "toggleRainAlarm") {
+    rainAlarmEnabled = !rainAlarmEnabled;
+    EEPROM.put(ADDR_RAIN_ALARM, rainAlarmEnabled ? 1 : 0); EEPROM.commit();
+    return true;
+  }
+  return false;
+}
+
+void cloudAckCommand(const String& commandId, bool success, const String& result) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  StaticJsonDocument<256> doc;
+  doc["id"] = commandId;
+  doc["success"] = success;
+  doc["result"] = result;
+
+  String body;
+  serializeJson(doc, body);
+
+  String url = String(cloudApiBase) + "/commands/ack";
+  HTTPClient http;
+  http.setTimeout(8000);
+  http.begin(cloudClient, url);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Device-Key", cloudDeviceKey);
+
+  int code = http.POST(body);
+  http.end();
+
+  Serial.printf("[Cloud] ACK %s -> HTTP %d\n", commandId.c_str(), code);
+}
+
+void cloudPushStatus() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String payload = buildStatusJson();
+  String url = String(cloudApiBase) + "/status/push";
+
+  HTTPClient http;
+  http.setTimeout(10000);
+  http.begin(cloudClient, url);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Device-Key", cloudDeviceKey);
+
+  int code = http.POST(payload);
+  http.end();
+
+  Serial.printf("[Cloud] Push -> HTTP %d\n", code);
+}
+
+void cloudPollCommands() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String url = String(cloudApiBase) + "/commands/poll";
+  HTTPClient http;
+  http.setTimeout(10000);
+  http.begin(cloudClient, url);
+  http.addHeader("X-Device-Key", cloudDeviceKey);
+
+  int code = http.GET();
+  if (code != 200) {
+    Serial.printf("[Cloud] Poll -> HTTP %d\n", code);
+    http.end();
+    return;
+  }
+
+  String response = http.getString();
+  http.end();
+
+  StaticJsonDocument<4096> doc;
+  DeserializationError err = deserializeJson(doc, response);
+  if (err) {
+    Serial.println("[Cloud] Poll JSON hatasi");
+    return;
+  }
+
+  JsonArray commands = doc["data"]["commands"].as<JsonArray>();
+  if (commands.isNull()) return;
+
+  for (JsonObject cmd : commands) {
+    String id = cmd["id"] | "";
+    String action = cmd["action"] | "";
+    JsonObject params = cmd["params"].is<JsonObject>() ? cmd["params"].as<JsonObject>() : JsonObject();
+    if (id == "" || action == "") continue;
+
+    bool ok = executeCloudCommand(action, params);
+    cloudAckCommand(id, ok, ok ? "OK" : "FAILED");
+    Serial.printf("[Cloud] Komut: %s -> %s\n", action.c_str(), ok ? "OK" : "FAIL");
+  }
+
+  // Komut uygulandıysa durumu hemen gönder
+  if (!commands.isNull() && commands.size() > 0) {
+    cloudPushStatus();
   }
 }
 
@@ -777,6 +1088,7 @@ void setup() {
   sensorOut.begin();
   sensorIn.begin();
   telegramClient.setInsecure();
+  cloudClient.setInsecure();
 
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.beginTransmission(MPU_ADDR);
@@ -820,6 +1132,7 @@ void setup() {
   while (WiFi.status()!=WL_CONNECTED) { delay(500); Serial.print("."); }
   WiFi.setSleep(false);
   Serial.println("\nWiFi bağlandı: " + WiFi.localIP().toString());
+  Serial.println("Bulut API: " + String(cloudApiBase));
 
   // ESP-NOW
   if (esp_now_init()==ESP_OK) {
@@ -886,46 +1199,7 @@ void setup() {
   
   server.on("/status", []() {
     if(!checkAuth()) return;
-    String json="{";
-    struct tm timeinfo; String timeStr="--:--",dateStr="--.--.----",dayStr="----";
-    if(getLocalTime(&timeinfo,10)){
-      char tB[10]; strftime(tB,sizeof(tB),"%H:%M",&timeinfo);
-      char dB[15]; strftime(dB,sizeof(dB),"%d.%m.%Y",&timeinfo);
-      timeStr=tB; dateStr=dB; dayStr=getDayName(timeinfo.tm_wday);
-    }
-    json+="\"time\":\""+timeStr+"\",\"date\":\""+dateStr+"\",\"day\":\""+dayStr+"\",";
-    json+=String("\"bat_main\":")+String(stateMainBat?1:0)+",\"ups\":"+String(stateUPS?1:0)+",";
-    for(int i=0;i<20;i++) json+="\"r"+String(i+1)+"\":"+String(stateR[i]?1:0)+",";
-
-    json+="\"temp\":"   +String(cache_temperature)    +",";
-    json+="\"t_out\":"  +String(cache_tempOutside)    +",";
-    json+="\"t_wat\":"  +String(cache_tempWater)      +",";
-    json+="\"t_ext\":"  +String(cache_tempExtra)      +",";
-    json+="\"water\":"  +String(cache_waterLevelPercent)+",";
-    json+="\"water_liter\":"+String(cache_waterLiters)+",";
-    json+="\"bat\":"    +String(cache_batteryVoltage) +",";
-    json+="\"bat_percent\":"+String(cache_batteryPercent)+",";
-    json+="\"mq2\":"    +String(cache_mq2)            +",";
-    json+="\"rain\":"   +String(cache_rainPercent)    +",";
-    json+="\"pitch\":"  +String(cache_pitch)          +",";
-    json+="\"roll\":"   +String(cache_roll)           +",";
-    json+="\"rs2\":"    +String(cache_rssi2)          +",";
-    json+="\"rs3\":"    +String(cache_rssi3)          +",";
-    json+="\"rs4\":"    +String(cache_rssi4)          +",";
-
-    for(int i=0;i<20;i++) json+="\"n"+String(i+1)+"\":\""+jsonEscape(relayNames[i])+"\",";
-    json+="\"wh_target\":"+String(targetWaterTemp)+",\"wh_on\":"+String(waterHeaterOn?1:0)+",\"wh_auto\":"+String(waterHeaterAutoMode?1:0)+",";
-    json+="\"f_target\":"+String(targetFridgeTemp)+",\"f_on\":"+String(fridgeFanOn?1:0)+",\"f_auto\":"+String(fridgeAutoMode?1:0)+",";
-    json+="\"w_pwr\":"+String(stateWebastoPower?1:0)+",\"w_target\":"+String(targetTemp)+",\"w_on\":"+String(webastoOn?1:0)+",\"w_auto\":"+String(webastoAutoMode?1:0)+",";
-    json+="\"gas_al\":"+String(gasAlarmEnabled?1:0)+",";
-    json+="\"rain_al\":"+String(rainAlarmEnabled?1:0)+",";
-    String info="";
-    if(!stateWebastoPower) info="GÜÇ KESİK (SİSTEM KAPALI)";
-    else if(webastoOn){unsigned long ms=totalWebastoOnTimeMs+(millis()-currentCycleStartTime);info="Calisma: "+String((ms/60000)/60)+"sa "+String((ms/60000)%60)+"dk";}
-    else if(!webastoAutoMode) info="Oto Mod Kapali";
-    else{unsigned long tso=millis()-lastTurnOffTime;info=(!firstRun&&tso<protectionTime)?"Koruma: "+String((protectionTime-tso)/1000)+" sn":"Sistem Hazir";}
-    json+="\"w_info\":\""+info+"\",\"rssi\":"+String(WiFi.RSSI())+"}";
-    server.send(200,"application/json",json);
+    server.send(200, "application/json", buildStatusJson());
   });
   server.begin();
   Serial.println("Web sunucusu başlatıldı.");
@@ -946,6 +1220,18 @@ void loop() {
     lastTelegramCheck = now;
     int n = bot.getUpdates(bot.last_message_received+1);
     while(n){ handleTelegramMessages(n); n=bot.getUpdates(bot.last_message_received+1); }
+  }
+
+  // Bulut API senkronizasyonu
+  if (!otaActive && WiFi.status() == WL_CONNECTED) {
+    if (now - lastCloudPoll >= cloudPollInterval) {
+      lastCloudPoll = now;
+      cloudPollCommands();
+    }
+    if (now - lastCloudPush >= cloudPushInterval) {
+      lastCloudPush = now;
+      cloudPushStatus();
+    }
   }
 
   // SLAVE TIMEOUT
